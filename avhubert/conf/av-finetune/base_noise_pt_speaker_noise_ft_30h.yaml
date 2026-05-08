@@ -7,7 +7,6 @@ common:
   tensorboard_logdir: tblog
   seed: 1337
   user_dir: ???
-  wandb_project: av_hubert_moe #de
 
 checkpoint:
   save_interval: 2
@@ -40,15 +39,14 @@ task:
   image_aug: true
   pad_audio: true
   random_crop: false
-  noise_prob: 0.25
+  noise_prob: 0.0
   noise_snr: 0
-  noise_wav: ???
-  noise_mode: none #de
-  noise_num: 0 #de
-
+  noise_wav: null
+  noise_mode: null
+  noise_num: 0
 
 dataset:
-  num_workers: 6
+  num_workers: 0
   max_tokens: 1000
   validate_after_updates: 0
   validate_interval: 2
@@ -65,7 +63,6 @@ optimization:
   lr: [0.001]
   sentence_avg: true
   update_freq: [1]
-  clip_norm: 50.0
 
 optimizer:
   _name: adam
@@ -91,7 +88,7 @@ model:
   mask_channel_length: 64
   mask_channel_other: 0
   mask_channel_prob: 0.5
-  layerdrop: 0.0 #de layer[1]의 
+  layerdrop: 0.1
   dropout: 0.0
   activation_dropout: 0.1
   attention_dropout: 0.0
@@ -103,7 +100,6 @@ model:
   freeze_finetune_updates: 24000
   share_decoder_input_output_embed: true
   decoder_normalize_before: true
-  moe_mode: none #de
 
 hydra:
   job:

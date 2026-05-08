@@ -20,4 +20,7 @@ dataset:
 override:
   noise_prob: 0.0
   noise_snr: 0
+  noise_num: 0 #de
+  noise_mode: None
   modalities: ???
+

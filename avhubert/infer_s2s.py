@@ -51,6 +51,8 @@ class OverrideConfig(FairseqDataclass):
     noise_wav: Optional[str] = field(default=None, metadata={'help': 'noise wav file'})
     noise_prob: float = field(default=0, metadata={'help': 'noise probability'})
     noise_snr: float = field(default=0, metadata={'help': 'noise SNR in audio'})
+    noise_num: int = field(default=0, metadata={'help': 'number of interference speakers'})
+    noise_mode: Optional[str] = field(default=None, metadata={'help': 'noise mode [None/mix]'}) #de
     modalities: List[str] = field(default_factory=lambda: [""], metadata={'help': 'which modality to use'})
     data: Optional[str] = field(default=None, metadata={'help': 'path to test data directory'})
     label_dir: Optional[str] = field(default=None, metadata={'help': 'path to test label directory'})
@@ -133,6 +135,8 @@ def _main(cfg, output_file):
     task.cfg.noise_prob = cfg.override.noise_prob
     task.cfg.noise_snr = cfg.override.noise_snr
     task.cfg.noise_wav = cfg.override.noise_wav
+    task.cfg.noise_num = cfg.override.noise_num
+    task.cfg.noise_mode = cfg.override.noise_mode #de
     if cfg.override.data is not None:
         task.cfg.data = cfg.override.data
     if cfg.override.label_dir is not None:
@@ -203,7 +207,7 @@ def _main(cfg, output_file):
     num_sentences = 0
     has_target = True
     wps_meter = TimeMeter()
-    result_dict = {'utt_id': [], 'ref': [], 'hypo': []}
+    result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'moe_ex': []}
     for sample in progress:
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
@@ -228,6 +232,24 @@ def _main(cfg, output_file):
         num_generated_tokens = sum(len(h[0]["tokens"]) for h in hypos)
         gen_timer.stop(num_generated_tokens)
 
+        # Compute per-sample MoE E[X] from the router probabilities stored by the forward hook.
+        # noise_logits shape: [T, B, 4], already softmaxed; classes represent 1/2/3/4 speakers.
+        moe_ex_per_sample = []
+        try:
+            noise_logits = models[0].encoder.w2v_model._noise_logits_ref[0]  # [T, B, 4]
+        except AttributeError:
+            noise_logits = None
+
+        if noise_logits is not None:
+            with torch.no_grad():
+                K = noise_logits.shape[-1]
+                speaker_indices = torch.arange(1, K + 1, dtype=noise_logits.dtype, device=noise_logits.device)
+                ex_per_frame = (noise_logits * speaker_indices).sum(dim=-1)  # [T, B]
+                for bi in range(ex_per_frame.shape[1]):
+                    moe_ex_per_sample.append(ex_per_frame[:, bi].mean().item())
+        else:
+            moe_ex_per_sample = [None] * len(sample["id"])
+
         for i in range(len(sample["id"])):
             result_dict['utt_id'].append(sample['utt_id'][i])
             ref_sent = decode_fn(sample['target'][i].int().cpu())
@@ -235,6 +257,8 @@ def _main(cfg, output_file):
             best_hypo = hypos[i][0]['tokens'].int().cpu()
             hypo_str = decode_fn(best_hypo)
             result_dict['hypo'].append(hypo_str)
+            ex_val = moe_ex_per_sample[i] if i < len(moe_ex_per_sample) else None
+            result_dict['moe_ex'].append(ex_val)
             logger.info(f"\nREF:{ref_sent}\nHYP:{hypo_str}\n")
         wps_meter.update(num_generated_tokens)
         progress.log({"wps": round(wps_meter.avg)})
@@ -256,12 +280,18 @@ def _main(cfg, output_file):
         n_err += editdistance.eval(hypo, ref)
         n_total += len(ref)
     wer = 100 * n_err / n_total
+    valid_ex = [v for v in result_dict['moe_ex'] if v is not None]
+    mean_ex = sum(valid_ex) / len(valid_ex) if valid_ex else None
     wer_fn = f"{cfg.common_eval.results_path}/wer.{fid}"
     with open(wer_fn, "w") as fo:
         fo.write(f"WER: {wer}\n")
-        fo.write(f"err / num_ref_words = {n_err} / {n_total}\n\n")
-        fo.write(f"{yaml_str}")
+        fo.write(f"err / num_ref_words = {n_err} / {n_total}\n")
+        if mean_ex is not None:
+            fo.write(f"MoE E[X] (mean over {len(valid_ex)} utterances): {mean_ex:.4f}\n")
+        fo.write(f"\n{yaml_str}")
     logger.info(f"WER: {wer}%")
+    if mean_ex is not None:
+        logger.info(f"MoE E[X] (avg): {mean_ex:.4f}  (computed over {len(valid_ex)} utterances)")
     return
 
 
