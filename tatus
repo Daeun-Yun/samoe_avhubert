@@ -1,0 +1,340 @@
+[1mdiff --git a/avhubert/conf/av-finetune/base_noise_pt_noise_ft_433h.yaml b/avhubert/conf/av-finetune/base_noise_pt_noise_ft_433h.yaml[m
+[1mindex 7712eee..a6fbda5 100644[m
+[1m--- a/avhubert/conf/av-finetune/base_noise_pt_noise_ft_433h.yaml[m
+[1m+++ b/avhubert/conf/av-finetune/base_noise_pt_noise_ft_433h.yaml[m
+[36m@@ -9,7 +9,7 @@[m [mcommon:[m
+   user_dir: ???[m
+ [m
+ checkpoint:[m
+[31m-  save_interval_updates: 5000[m
+[32m+[m[32m  save_interval_updates: 20000[m
+   keep_interval_updates: -1[m
+   no_epoch_checkpoints: true[m
+   best_checkpoint_metric: accuracy[m
+[36m@@ -90,7 +90,7 @@[m [mmodel:[m
+   mask_channel_length: 64[m
+   mask_channel_other: 0[m
+   mask_channel_prob: 0.5[m
+[31m-  layerdrop: 0.0 #0.1[m
+[32m+[m[32m  layerdrop: 0.1 #0.1[m
+   dropout: 0.0[m
+   activation_dropout: 0.1[m
+   attention_dropout: 0.0[m
+[1mdiff --git a/avhubert/hubert.py b/avhubert/hubert.py[m
+[1mindex 258afd1..ad523ce 100644[m
+[1m--- a/avhubert/hubert.py[m
+[1m+++ b/avhubert/hubert.py[m
+[36m@@ -323,32 +323,6 @@[m [mclass AVHubertConfig(FairseqDataclass):[m
+     )[m
+     no_scale_embedding: bool = field(default=True, metadata={'help': 'scale embedding'})[m
+ [m
+[31m-class LoRALinear(nn.Module):[m
+[31m-    """단일 Linear를 래핑해서 LoRA MoE를 덧붙임. full 모드의 attention projection에 사용."""[m
+[31m-    def __init__(self, base_linear, in_features, out_features, noise_logits_ref, num_experts=4, rank=1):[m
+[31m-        super().__init__()[m
+[31m-        self.base = base_linear[m
+[31m-        self.noise_logits_ref = noise_logits_ref[m
+[31m-        self.lora_A = nn.Linear(in_features, rank, bias=False)[m
+[31m-        self.lora_B = nn.ModuleList([[m
+[31m-            nn.Linear(rank, out_features, bias=False) for _ in range(num_experts)[m
+[31m-        ])[m
+[31m-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))[m
+[31m-        self.lora_A.weight.data *= 0.01[m
+[31m-        for b in self.lora_B:[m
+[31m-            nn.init.zeros_(b.weight)[m
+[31m-[m
+[31m-    def forward(self, x):[m
+[31m-        noise_logits = self.noise_logits_ref[0][m
+[31m-        a_out = self.lora_A(x)[m
+[31m-        expert_outs = torch.stack([b(a_out) for b in self.lora_B], dim=-1)  # [T, B, out_dim, num_experts][m
+[31m-        if noise_logits is not None:[m
+[31m-            weights = noise_logits.unsqueeze(2)                              # [T, B, 1, num_experts][m
+[31m-        else:[m
+[31m-            T, B = x.size(0), x.size(1)[m
+[31m-            weights = x.new_ones(T, B, 1, len(self.lora_B)) / len(self.lora_B)[m
+[31m-        return self.base(x) + (expert_outs * weights).sum(dim=-1)[m
+[31m-[m
+ [m
+ class LoRAMoETransformerLayer(nn.Module):[m
+     """[m
+[36m@@ -396,13 +370,16 @@[m [mclass LoRAMoETransformerLayer(nn.Module):[m
+         for b in self.lora_B_fc2:[m
+             nn.init.zeros_(b.weight)[m
+ [m
+[31m-        # full 모드: attention projection도 LoRALinear로 교체[m
+[32m+[m[32m        # full 모드: attention용 LoRA (embed_dim → rank → embed_dim), additive 방식[m
+         if moe_mode == 'full':[m
+[31m-            sa = self.self_attn[m
+[31m-            sa.q_proj = LoRALinear(sa.q_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)[m
+[31m-            sa.k_proj = LoRALinear(sa.k_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)[m
+[31m-            sa.v_proj = LoRALinear(sa.v_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)[m
+[31m-            sa.out_proj = LoRALinear(sa.out_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)[m
+[32m+[m[32m            self.lora_A_attn = nn.Linear(embed_dim, rank, bias=False)[m
+[32m+[m[32m            self.lora_B_attn = nn.ModuleList([[m
+[32m+[m[32m                nn.Linear(rank, embed_dim, bias=False) for _ in range(num_experts)[m
+[32m+[m[32m            ])[m
+[32m+[m[32m            nn.init.kaiming_uniform_(self.lora_A_attn.weight, a=math.sqrt(5))[m
+[32m+[m[32m            self.lora_A_attn.weight.data *= 0.01[m
+[32m+[m[32m            for b in self.lora_B_attn:[m
+[32m+[m[32m                nn.init.zeros_(b.weight)[m
+ [m
+     def _apply_lora_moe(self, x, lora_A, lora_B):[m
+         # x: [T, B, in_dim][m
+[36m@@ -422,9 +399,12 @@[m [mclass LoRAMoETransformerLayer(nn.Module):[m
+ [m
+         if self.layer_norm_first:[m
+             x = self.self_attn_layer_norm(x)[m
+[32m+[m[32m            attn_in = x[m
+             x, attn = self.self_attn(query=x, key=x, value=x,[m
+                                      key_padding_mask=self_attn_padding_mask,[m
+                                      attn_mask=self_attn_mask)[m
+[32m+[m[32m            if self.moe_mode == 'full':[m
+[32m+[m[32m                x = x + self._apply_lora_moe(attn_in, self.lora_A_attn, self.lora_B_attn)[m
+             x = self.dropout1(x)[m
+             x = residual + x[m
+ [m
+[36m@@ -438,8 +418,11 @@[m [mclass LoRAMoETransformerLayer(nn.Module):[m
+             x = self.dropout3(x)[m
+             x = residual + x[m
+         else:[m
+[32m+[m[32m            attn_in = x[m
+             x, attn = self.self_attn(query=x, key=x, value=x,[m
+                                      key_padding_mask=self_attn_padding_mask)[m
+[32m+[m[32m            if self.moe_mode == 'full':[m
+[32m+[m[32m                x = x + self._apply_lora_moe(attn_in, self.lora_A_attn, self.lora_B_attn)[m
+             x = self.dropout1(x)[m
+             x = residual + x[m
+             x = self.self_attn_layer_norm(x)[m
+[36m@@ -539,6 +522,10 @@[m [mclass AVHubertModel(BaseFairseqModel):[m
+             torch.FloatTensor(cfg.audio_feat_dim).uniform_() if self.masking_type == 'input' else torch.FloatTensor(cfg.encoder_embed_dim).uniform_()[m
+         )[m
+ [m
+[32m+[m[32m        if cfg.moe_mode not in ('none', 'None', None):[m
+[32m+[m[32m            from omegaconf import open_dict[m
+[32m+[m[32m            with open_dict(cfg):[m
+[32m+[m[32m                cfg.encoder_layerdrop = 0.0[m
+         self.encoder = TransformerEncoder(cfg)[m
+         self.layer_norm = LayerNorm(self.embed)[m
+ [m
+[1mdiff --git a/avhubert/hubert_dataset.py b/avhubert/hubert_dataset.py[m
+[1mindex 11058c7..c8eec35 100644[m
+[1m--- a/avhubert/hubert_dataset.py[m
+[1m+++ b/avhubert/hubert_dataset.py[m
+[36m@@ -6,6 +6,7 @@[m
+ [m
+ import itertools[m
+ import logging[m
+[32m+[m[32mimport multiprocessing as mp[m
+ import os[m
+ import sys[m
+ import time[m
+[36m@@ -167,7 +168,7 @@[m [mclass AVHubertDataset(FairseqDataset):[m
+             noise_fn=None,[m
+             noise_prob=0,[m
+             noise_snr=0,[m
+[31m-            noise_num=1,[m
+[32m+[m[32m            noise_num=0,[m
+             noise_mode=None, #de[m
+             max_update=150000, #de[m
+     ):[m
+[36m@@ -192,6 +193,7 @@[m [mclass AVHubertDataset(FairseqDataset):[m
+         self.is_s2s = is_s2s[m
+         self.noise_wav, self.noise_prob, self.noise_snr, self.noise_num, self.noise_mode = [ln.strip() for ln in open(noise_fn).readlines()] if noise_fn is not None else [], noise_prob, noise_snr, noise_num, noise_mode[m
+         self.max_update = max_update[m
+[32m+[m[32m        self._current_update = mp.Value('i', 0)  # CL 모드: worker 프로세스와 공유메모리로 step 공유[m
+ [m
+         assert self.single_target == (self.label_rates[0] == -1), f"single target should be equivalent to sequence label (label_rate==-1)"[m
+         if store_labels:[m
+[36m@@ -237,6 +239,56 @@[m [mclass AVHubertDataset(FairseqDataset):[m
+             f"Noise wav: {noise_fn}->{len(self.noise_wav)} wav, Prob: {self.noise_prob}, SNR: {self.noise_snr}, Number of mixture: {self.noise_num}"[m
+         )[m
+ [m
+[32m+[m[32m    _CL_STAGE_PROBS = [[m
+[32m+[m[32m        [0.0, 1.0, 0.0, 0.0],                    # Stage 1: 항상 1명[m
+[32m+[m[32m        [0.5, 0.5, 0.0, 0.0],                    # Stage 2: {0,1}[m
+[32m+[m[32m        [1/3, 1/3, 1/3, 0.0],                    # Stage 3: {0,1,2}[m
+[32m+[m[32m        [0.25, 0.25, 0.25, 0.25],                # Stage 4: {0,1,2,3}[m
+[32m+[m[32m    ][m
+[32m+[m
+[32m+[m[32m    _CBCL_STAGE_PROBS = [[m
+[32m+[m[32m        [0.0, 1.0, 0.0, 0.0],                    # Stage 1: 간섭 1명만 (0~50%)[m
+[32m+[m[32m        [0.5, 0.5, 0.0, 0.0],                    # Stage 2: 0명=50%, 이전(1명)=50%[m
+[32m+[m[32m        [0.25, 0.25, 0.5, 0.0],                  # Stage 3: 2명=50%, 이전({0,1}=50%)[m
+[32m+[m[32m        [0.125, 0.125, 0.25, 0.5],               # Stage 4: 3명=50%, 이전({0,1,2}=50%)[m
+[32m+[m[32m    ][m
+[32m+[m[32m    # CBCL stage 전환 비율: [0.5, 4/6, 5/6] * max_update[m
+[32m+[m[32m    _CBCL_STAGE_RATIOS = (0.5, 4/6, 5/6)[m
+[32m+[m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def current_update(self):[m
+[32m+[m[32m        return self._current_update.value[m
+[32m+[m
+[32m+[m[32m    def _cbcl_stage(self, update):[m
+[32m+[m[32m        return sum(update >= r * self.max_update for r in self._CBCL_STAGE_RATIOS)[m
+[32m+[m
+[32m+[m[32m    @current_update.setter[m
+[32m+[m[32m    def current_update(self, value):[m
+[32m+[m[32m        if self.noise_mode == 'CL' or self.noise_mode == 'cl':[m
+[32m+[m[32m            old_stage = self._cbcl_stage(self._current_update.value)[m
+[32m+[m[32m            new_stage = self._cbcl_stage(value)[m
+[32m+[m[32m            self._current_update.value = value[m
+[32m+[m[32m            if new_stage != old_stage:[m
+[32m+[m[32m                p = self._CL_STAGE_PROBS[new_stage][m
+[32m+[m[32m                logger.info([m
+[32m+[m[32m                    f"[CL] Stage {new_stage + 1}: "[m
+[32m+[m[32m                    f"{{{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}, {p[3]:.3f}}}"[m
+[32m+[m[32m                    f"  (update={value})"[m
+[32m+[m[32m                )[m
+[32m+[m[32m        elif self.noise_mode == 'CBCL' or self.noise_mode == 'cbcl':[m
+[32m+[m[32m            old_stage = self._cbcl_stage(self._current_update.value)[m
+[32m+[m[32m            new_stage = self._cbcl_stage(value)[m
+[32m+[m[32m            self._current_update.value = value[m
+[32m+[m[32m            if new_stage != old_stage:[m
+[32m+[m[32m                p = self._CBCL_STAGE_PROBS[new_stage][m
+[32m+[m[32m                logger.info([m
+[32m+[m[32m                    f"[CBCL] Stage {new_stage + 1}: "[m
+[32m+[m[32m                    f"{{{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}, {p[3]:.3f}}}"[m
+[32m+[m[32m                    f"  (update={value})"[m
+[32m+[m[32m                )[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            self._current_update.value = value[m
+[32m+[m
+     def get_label(self, index, label_idx):[m
+         if self.store_labels:[m
+             label = self.label_list[label_idx][index][m
+[36m@@ -312,11 +364,29 @@[m [mclass AVHubertDataset(FairseqDataset):[m
+         if cur_index is not None and cur_index in indices:[m
+             indices.remove(cur_index)[m
+ [m
+[31m-        #mix모드일 경우 num_speakers 랜덤추출[m
+[31m-        if self.noise_mode == 'mix':[m
+[32m+[m[32m        #noise_mode별 num_speakers 결정[m
+[32m+[m[32m        if self.noise_mode == 'CL' or self.noise_mode == 'cl':[m
+[32m+[m[32m            # Curriculum Learning: CBCL과 동일한 비율로 stage 전환 (0.5, 4/6, 5/6) * max_update[m
+[32m+[m[32m            # 난이도: {1} → {0,1} → {0,1,2} → {0,1,2,3}[m
+[32m+[m[32m            stage = self._cbcl_stage(self.current_update)[m
+[32m+[m[32m            if stage == 0:[m
+[32m+[m[32m                num_speakers = 1                         # Stage1: 항상 1명[m
+[32m+[m[32m            elif stage == 1:[m
+[32m+[m[32m                num_speakers = np.random.randint(0, 2)  # Stage2: {0,1}[m
+[32m+[m[32m            elif stage == 2:[m
+[32m+[m[32m                num_speakers = np.random.randint(0, 3)  # Stage3: {0,1,2}[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                num_speakers = np.random.randint(0, 4)  # Stage4: {0,1,2,3}[m
+[32m+[m[32m        elif self.noise_mode == 'CBCL' or self.noise_mode == 'cbcl':[m
+[32m+[m[32m            # Class-Balanced CL: Stage1=50%(간섭1명), 이후 각 1/6씩 단계 추가[m
+[32m+[m[32m            # 새 단계=50%, 이전 구성=50% 누적[m
+[32m+[m[32m            stage = self._cbcl_stage(self.current_update)[m
+[32m+[m[32m            p = self._CBCL_STAGE_PROBS[stage][m
+[32m+[m[32m            num_speakers = np.random.choice([0, 1, 2, 3], p=p)[m
+[32m+[m[32m        elif self.noise_mode == 'mix':[m
+             num_speakers = np.random.randint(0, self.noise_num + 1)  # 0~noise_num random intervention[m
+             # num_speakers = 1[m
+[31m-            # num_speakers = np.random.choice([0, 1], p=[0.5,0.5]) [m
+[32m+[m[32m            # num_speakers = np.random.choice([0, 1], p=[0.5,0.5])[m
+             # num_speakers = np.random.choice([0, 1, 2], p=[0.25, 0.25, 0.50])[m
+             # num_speakers = np.random.choice([0, 1, 2, 3], p=[0.125,0.125,0.25,0.50])[m
+         else:[m
+[36m@@ -353,8 +423,9 @@[m [mclass AVHubertDataset(FairseqDataset):[m
+             #noise 구간 자르기[m
+         clean_rms = np.sqrt(np.mean(np.square(clean_wav), axis=-1))[m
+ [m
+[31m-        if num_speakers == 0 and self.noise_mode == 'mix':[m
+[31m-            # mix 모드에서 0명: 1명 랜덤 선택 후 10dB SNR로 추가 (논문 1-speaker data augmentation)[m
+[32m+[m[32m        if num_speakers == 0 and self.noise_mode not in (None, 'none', 'None'):[m
+[32m+[m[32m            # none이 아닌 모드에서 0명: 1명 랜덤 선택 후 10dB SNR로 추가 (논문 1-speaker data augmentation)[m
+[32m+[m[32m            # mix / CL stage2~4 모두 해당[m
+             indices = list(range(len(self.names)))[m
+             if cur_index is not None and cur_index in indices:[m
+                 indices.remove(cur_index)[m
+[1mdiff --git a/avhubert/hubert_pretraining.py b/avhubert/hubert_pretraining.py[m
+[1mindex 6e1a05f..851aa59 100644[m
+[1m--- a/avhubert/hubert_pretraining.py[m
+[1m+++ b/avhubert/hubert_pretraining.py[m
+[36m@@ -155,9 +155,9 @@[m [mclass AVHubertPretrainingConfig(FairseqDataclass):[m
+     noise_wav: Optional[str] = field(default=None, metadata={'help': 'manifest of noise wav files (one wav file path per line)'})[m
+     noise_prob: float = field(default=0, metadata={'help': 'noise probability'})[m
+     noise_snr: Optional[str] = field(default='0', metadata={'help': 'noise SNR in audio'})[m
+[31m-    noise_num: int = field(default=1, metadata={'help': 'number of noise wav files to mix'})[m
+[32m+[m[32m    noise_num: Optional[int] = field(default=0, metadata={'help': 'number of noise wav files to mix (CL 모드에서는 무시됨)'})[m
+     fine_tuning: bool = field(default=False, metadata={"help": "set to true if fine-tuning AV-Hubert"})[m
+[31m-    max_update : int = field(default=30000, metadata={'help': 'maximum value of update parameters'})[m
+[32m+[m[32m    max_update : int = field(default=II("optimization.max_update"), metadata={'help': 'maximum number of updates, interpolated from optimization.max_update'})[m
+     noise_mode : Optional[str] = field(default=None, metadata={'help': 'how to add noise [None(n intervention)/mix(1~3)]'})[m
+ [m
+ [m
+[36m@@ -244,7 +244,7 @@[m [mclass AVHubertPretrainingTask(FairseqTask):[m
+         ][m
+         image_aug = self.cfg.image_aug if split == 'train' else False[m
+         noise_fn, noise_snr = f"{self.cfg.noise_wav}/{split}.tsv" if self.cfg.noise_wav is not None else None, eval(self.cfg.noise_snr)[m
+[31m-        noise_num = self.cfg.noise_num # [m
+[32m+[m[32m        noise_num = self.cfg.noise_num if self.cfg.noise_num is not None else 0  # CL 모드에서는 dataset 내부에서 stage별로 결정[m
+         self.datasets[split] = AVHubertDataset([m
+             manifest,[m
+             sample_rate=self.cfg.sample_rate,[m
+[36m@@ -279,6 +279,12 @@[m [mclass AVHubertPretrainingTask(FairseqTask):[m
+             [m
+         )[m
+ [m
+[32m+[m[32m    def train_step(self, sample, model, criterion, optimizer, update_num, ignore_grad=False):[m
+[32m+[m[32m        for dataset in self.datasets.values():[m
+[32m+[m[32m            if hasattr(dataset, 'current_update'):[m
+[32m+[m[32m                dataset.current_update = update_num[m
+[32m+[m[32m        return super().train_step(sample, model, criterion, optimizer, update_num, ignore_grad)[m
+[32m+[m
+     def max_positions(self) -> Tuple[int, int]:[m
+         return (sys.maxsize, sys.maxsize)[m
+ [m
+[1mdiff --git a/fairseq/fairseq/criterions/label_smoothed_cross_entropy.py b/fairseq/fairseq/criterions/label_smoothed_cross_entropy.py[m
+[1mindex 5f1ce01..990199e 100644[m
+[1m--- a/fairseq/fairseq/criterions/label_smoothed_cross_entropy.py[m
+[1m+++ b/fairseq/fairseq/criterions/label_smoothed_cross_entropy.py[m
+[36m@@ -83,9 +83,11 @@[m [mclass LabelSmoothedCrossEntropyCriterion(FairseqCriterion):[m
+         )[m
+ [m
+         asr_loss = loss  # noise_loss 더하기 전 ASR loss[m
+[31m-        if "noise_label" in sample and "noise_logits" in net_output[1]:[m
+[32m+[m[32m        noise_label = sample.get("noise_label", None)  # [B] or None[m
+[32m+[m
+[32m+[m[32m        if noise_label is not None and "noise_logits" in net_output[1]:[m
+             noise_logits = net_output[1]["noise_logits"]                   # [T, B, 4][m
+[31m-            noise_label = sample["noise_label"].to(noise_logits.device)    # [B][m
+[32m+[m[32m            noise_label = noise_label.to(noise_logits.device)              # [B][m
+             T, B, E = noise_logits.shape[m
+             log_probs = torch.log(noise_logits.clamp(min=1e-8))            # [T, B, 4][m
+             frame_nll = -log_probs[:, torch.arange(B, device=noise_logits.device), noise_label]  # [T, B][m
+[36m@@ -112,25 +114,24 @@[m [mclass LabelSmoothedCrossEntropyCriterion(FairseqCriterion):[m
+                 # 2. Expert load (전체 토큰 합산)[m
+                 expert_sums = noise_logits.sum(0).sum(0)  # [E][m
+ [m
+[31m-                # 3. 발화별 T 방향 평균 → speaker 분포 카운트 + 라우터 예측값 계산에 재사용[m
+[32m+[m[32m                # 3. 라우터 예측 화자 수 기댓값 (발화 단위)[m
+                 per_utt = noise_logits.mean(0)  # [B, E][m
+[31m-                spk_cnts = {}[m
+[31m-                for n in range(4):[m
+[31m-                    mask_n = noise_label == n[m
+[31m-                    if mask_n.any():[m
+[31m-                        spk_cnts[n] = mask_n.sum().item()[m
+[31m-[m
+[31m-                # 4. 라우터 예측 화자 수 기댓값 (발화 단위, num_speaker_avg와 동일 단위)[m
+                 spk_values = torch.arange(E, device=noise_logits.device, dtype=noise_logits.dtype)[m
+                 router_pred_spk_sum = (per_utt * spk_values).sum(-1).sum().item()  # [B] → scalar[m
+         else:[m
+             noise_loss = None[m
+             moe_entropy_sum = moe_token_count = 0[m
+             expert_sums = None[m
+[31m-            spk_cnts = {}[m
+[31m-            noise_label = None[m
+             router_pred_spk_sum = 0[m
+ [m
+[32m+[m[32m        # speaker_load: noise_logits 유무와 무관하게 noise_label 분포를 항상 집계[m
+[32m+[m[32m        spk_cnts = {}[m
+[32m+[m[32m        if noise_label is not None:[m
+[32m+[m[32m            for n in range(4):[m
+[32m+[m[32m                mask_n = noise_label == n[m
+[32m+[m[32m                if mask_n.any():[m
+[32m+[m[32m                    spk_cnts[n] = mask_n.sum().item()[m
+[32m+[m
+         logging_output = {[m
+             "loss": loss.data,                                          # total loss (asr + noise)[m
+             "asr_loss": asr_loss.data,                                  # ASR label-smoothed loss[m

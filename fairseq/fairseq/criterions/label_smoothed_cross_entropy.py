@@ -83,9 +83,11 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         )
 
         asr_loss = loss  # noise_loss 더하기 전 ASR loss
-        if "noise_label" in sample and "noise_logits" in net_output[1]:
+        noise_label = sample.get("noise_label", None)  # [B] or None
+
+        if noise_label is not None and "noise_logits" in net_output[1]:
             noise_logits = net_output[1]["noise_logits"]                   # [T, B, 4]
-            noise_label = sample["noise_label"].to(noise_logits.device)    # [B]
+            noise_label = noise_label.to(noise_logits.device)              # [B]
             T, B, E = noise_logits.shape
             log_probs = torch.log(noise_logits.clamp(min=1e-8))            # [T, B, 4]
             frame_nll = -log_probs[:, torch.arange(B, device=noise_logits.device), noise_label]  # [T, B]
@@ -112,24 +114,23 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
                 # 2. Expert load (전체 토큰 합산)
                 expert_sums = noise_logits.sum(0).sum(0)  # [E]
 
-                # 3. 발화별 T 방향 평균 → speaker 분포 카운트 + 라우터 예측값 계산에 재사용
+                # 3. 라우터 예측 화자 수 기댓값 (발화 단위)
                 per_utt = noise_logits.mean(0)  # [B, E]
-                spk_cnts = {}
-                for n in range(4):
-                    mask_n = noise_label == n
-                    if mask_n.any():
-                        spk_cnts[n] = mask_n.sum().item()
-
-                # 4. 라우터 예측 화자 수 기댓값 (발화 단위, num_speaker_avg와 동일 단위)
                 spk_values = torch.arange(E, device=noise_logits.device, dtype=noise_logits.dtype)
                 router_pred_spk_sum = (per_utt * spk_values).sum(-1).sum().item()  # [B] → scalar
         else:
             noise_loss = None
             moe_entropy_sum = moe_token_count = 0
             expert_sums = None
-            spk_cnts = {}
-            noise_label = None
             router_pred_spk_sum = 0
+
+        # speaker_load: noise_logits 유무와 무관하게 noise_label 분포를 항상 집계
+        spk_cnts = {}
+        if noise_label is not None:
+            for n in range(4):
+                mask_n = noise_label == n
+                if mask_n.any():
+                    spk_cnts[n] = mask_n.sum().item()
 
         logging_output = {
             "loss": loss.data,                                          # total loss (asr + noise)

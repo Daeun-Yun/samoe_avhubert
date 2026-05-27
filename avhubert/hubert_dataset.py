@@ -6,6 +6,7 @@
 
 import itertools
 import logging
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -167,7 +168,7 @@ class AVHubertDataset(FairseqDataset):
             noise_fn=None,
             noise_prob=0,
             noise_snr=0,
-            noise_num=1,
+            noise_num=0,
             noise_mode=None, #de
             max_update=150000, #de
     ):
@@ -192,6 +193,7 @@ class AVHubertDataset(FairseqDataset):
         self.is_s2s = is_s2s
         self.noise_wav, self.noise_prob, self.noise_snr, self.noise_num, self.noise_mode = [ln.strip() for ln in open(noise_fn).readlines()] if noise_fn is not None else [], noise_prob, noise_snr, noise_num, noise_mode
         self.max_update = max_update
+        self._current_update = mp.Value('i', 0)  # CL 모드: worker 프로세스와 공유메모리로 step 공유
 
         assert self.single_target == (self.label_rates[0] == -1), f"single target should be equivalent to sequence label (label_rate==-1)"
         if store_labels:
@@ -236,6 +238,56 @@ class AVHubertDataset(FairseqDataset):
         logger.info(
             f"Noise wav: {noise_fn}->{len(self.noise_wav)} wav, Prob: {self.noise_prob}, SNR: {self.noise_snr}, Number of mixture: {self.noise_num}"
         )
+
+    _CL_STAGE_PROBS = [
+        [0.0, 1.0, 0.0, 0.0],                    # Stage 1: 항상 1명
+        [0.5, 0.5, 0.0, 0.0],                    # Stage 2: {0,1}
+        [1/3, 1/3, 1/3, 0.0],                    # Stage 3: {0,1,2}
+        [0.25, 0.25, 0.25, 0.25],                # Stage 4: {0,1,2,3}
+    ]
+
+    _CBCL_STAGE_PROBS = [
+        [0.0, 1.0, 0.0, 0.0],                    # Stage 1: 간섭 1명만 (0~50%)
+        [0.5, 0.5, 0.0, 0.0],                    # Stage 2: 0명=50%, 이전(1명)=50%
+        [0.25, 0.25, 0.5, 0.0],                  # Stage 3: 2명=50%, 이전({0,1}=50%)
+        [0.125, 0.125, 0.25, 0.5],               # Stage 4: 3명=50%, 이전({0,1,2}=50%)
+    ]
+    # CBCL stage 전환 비율: [0.5, 4/6, 5/6] * max_update
+    _CBCL_STAGE_RATIOS = (0.5, 4/6, 5/6)
+
+    @property
+    def current_update(self):
+        return self._current_update.value
+
+    def _cbcl_stage(self, update):
+        return sum(update >= r * self.max_update for r in self._CBCL_STAGE_RATIOS)
+
+    @current_update.setter
+    def current_update(self, value):
+        if self.noise_mode == 'CL' or self.noise_mode == 'cl':
+            old_stage = self._cbcl_stage(self._current_update.value)
+            new_stage = self._cbcl_stage(value)
+            self._current_update.value = value
+            if new_stage != old_stage:
+                p = self._CL_STAGE_PROBS[new_stage]
+                logger.info(
+                    f"[CL] Stage {new_stage + 1}: "
+                    f"{{{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}, {p[3]:.3f}}}"
+                    f"  (update={value})"
+                )
+        elif self.noise_mode == 'CBCL' or self.noise_mode == 'cbcl':
+            old_stage = self._cbcl_stage(self._current_update.value)
+            new_stage = self._cbcl_stage(value)
+            self._current_update.value = value
+            if new_stage != old_stage:
+                p = self._CBCL_STAGE_PROBS[new_stage]
+                logger.info(
+                    f"[CBCL] Stage {new_stage + 1}: "
+                    f"{{{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}, {p[3]:.3f}}}"
+                    f"  (update={value})"
+                )
+        else:
+            self._current_update.value = value
 
     def get_label(self, index, label_idx):
         if self.store_labels:
@@ -312,11 +364,29 @@ class AVHubertDataset(FairseqDataset):
         if cur_index is not None and cur_index in indices:
             indices.remove(cur_index)
 
-        #mix모드일 경우 num_speakers 랜덤추출
-        if self.noise_mode == 'mix':
+        #noise_mode별 num_speakers 결정
+        if self.noise_mode == 'CL' or self.noise_mode == 'cl':
+            # Curriculum Learning: CBCL과 동일한 비율로 stage 전환 (0.5, 4/6, 5/6) * max_update
+            # 난이도: {1} → {0,1} → {0,1,2} → {0,1,2,3}
+            stage = self._cbcl_stage(self.current_update)
+            if stage == 0:
+                num_speakers = 1                         # Stage1: 항상 1명
+            elif stage == 1:
+                num_speakers = np.random.randint(0, 2)  # Stage2: {0,1}
+            elif stage == 2:
+                num_speakers = np.random.randint(0, 3)  # Stage3: {0,1,2}
+            else:
+                num_speakers = np.random.randint(0, 4)  # Stage4: {0,1,2,3}
+        elif self.noise_mode == 'CBCL' or self.noise_mode == 'cbcl':
+            # Class-Balanced CL: Stage1=50%(간섭1명), 이후 각 1/6씩 단계 추가
+            # 새 단계=50%, 이전 구성=50% 누적
+            stage = self._cbcl_stage(self.current_update)
+            p = self._CBCL_STAGE_PROBS[stage]
+            num_speakers = np.random.choice([0, 1, 2, 3], p=p)
+        elif self.noise_mode == 'mix':
             num_speakers = np.random.randint(0, self.noise_num + 1)  # 0~noise_num random intervention
             # num_speakers = 1
-            # num_speakers = np.random.choice([0, 1], p=[0.5,0.5]) 
+            # num_speakers = np.random.choice([0, 1], p=[0.5,0.5])
             # num_speakers = np.random.choice([0, 1, 2], p=[0.25, 0.25, 0.50])
             # num_speakers = np.random.choice([0, 1, 2, 3], p=[0.125,0.125,0.25,0.50])
         else:
@@ -353,8 +423,9 @@ class AVHubertDataset(FairseqDataset):
             #noise 구간 자르기
         clean_rms = np.sqrt(np.mean(np.square(clean_wav), axis=-1))
 
-        if num_speakers == 0 and self.noise_mode == 'mix':
-            # mix 모드에서 0명: 1명 랜덤 선택 후 10dB SNR로 추가 (논문 1-speaker data augmentation)
+        if num_speakers == 0 and self.noise_mode not in (None, 'none', 'None'):
+            # none이 아닌 모드에서 0명: 1명 랜덤 선택 후 10dB SNR로 추가 (논문 1-speaker data augmentation)
+            # mix / CL stage2~4 모두 해당
             indices = list(range(len(self.names)))
             if cur_index is not None and cur_index in indices:
                 indices.remove(cur_index)

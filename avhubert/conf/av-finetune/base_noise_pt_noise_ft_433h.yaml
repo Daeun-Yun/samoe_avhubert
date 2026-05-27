@@ -9,7 +9,7 @@ common:
   user_dir: ???
 
 checkpoint:
-  save_interval_updates: 5000
+  save_interval_updates: 20000
   keep_interval_updates: -1
   no_epoch_checkpoints: true
   best_checkpoint_metric: accuracy
@@ -90,7 +90,7 @@ model:
   mask_channel_length: 64
   mask_channel_other: 0
   mask_channel_prob: 0.5
-  layerdrop: 0.0 #0.1
+  layerdrop: 0.1 #0.1
   dropout: 0.0
   activation_dropout: 0.1
   attention_dropout: 0.0

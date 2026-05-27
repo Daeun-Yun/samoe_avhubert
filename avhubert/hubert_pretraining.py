@@ -155,9 +155,9 @@ class AVHubertPretrainingConfig(FairseqDataclass):
     noise_wav: Optional[str] = field(default=None, metadata={'help': 'manifest of noise wav files (one wav file path per line)'})
     noise_prob: float = field(default=0, metadata={'help': 'noise probability'})
     noise_snr: Optional[str] = field(default='0', metadata={'help': 'noise SNR in audio'})
-    noise_num: int = field(default=1, metadata={'help': 'number of noise wav files to mix'})
+    noise_num: Optional[int] = field(default=0, metadata={'help': 'number of noise wav files to mix (CL 모드에서는 무시됨)'})
     fine_tuning: bool = field(default=False, metadata={"help": "set to true if fine-tuning AV-Hubert"})
-    max_update : int = field(default=30000, metadata={'help': 'maximum value of update parameters'})
+    max_update : int = field(default=II("optimization.max_update"), metadata={'help': 'maximum number of updates, interpolated from optimization.max_update'})
     noise_mode : Optional[str] = field(default=None, metadata={'help': 'how to add noise [None(n intervention)/mix(1~3)]'})
 
 
@@ -244,7 +244,7 @@ class AVHubertPretrainingTask(FairseqTask):
         ]
         image_aug = self.cfg.image_aug if split == 'train' else False
         noise_fn, noise_snr = f"{self.cfg.noise_wav}/{split}.tsv" if self.cfg.noise_wav is not None else None, eval(self.cfg.noise_snr)
-        noise_num = self.cfg.noise_num # 
+        noise_num = self.cfg.noise_num if self.cfg.noise_num is not None else 0  # CL 모드에서는 dataset 내부에서 stage별로 결정
         self.datasets[split] = AVHubertDataset(
             manifest,
             sample_rate=self.cfg.sample_rate,
@@ -278,6 +278,12 @@ class AVHubertPretrainingTask(FairseqTask):
 
             
         )
+
+    def train_step(self, sample, model, criterion, optimizer, update_num, ignore_grad=False):
+        for dataset in self.datasets.values():
+            if hasattr(dataset, 'current_update'):
+                dataset.current_update = update_num
+        return super().train_step(sample, model, criterion, optimizer, update_num, ignore_grad)
 
     def max_positions(self) -> Tuple[int, int]:
         return (sys.maxsize, sys.maxsize)

@@ -323,32 +323,6 @@ class AVHubertConfig(FairseqDataclass):
     )
     no_scale_embedding: bool = field(default=True, metadata={'help': 'scale embedding'})
 
-class LoRALinear(nn.Module):
-    """단일 Linear를 래핑해서 LoRA MoE를 덧붙임. full 모드의 attention projection에 사용."""
-    def __init__(self, base_linear, in_features, out_features, noise_logits_ref, num_experts=4, rank=1):
-        super().__init__()
-        self.base = base_linear
-        self.noise_logits_ref = noise_logits_ref
-        self.lora_A = nn.Linear(in_features, rank, bias=False)
-        self.lora_B = nn.ModuleList([
-            nn.Linear(rank, out_features, bias=False) for _ in range(num_experts)
-        ])
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        self.lora_A.weight.data *= 0.01
-        for b in self.lora_B:
-            nn.init.zeros_(b.weight)
-
-    def forward(self, x):
-        noise_logits = self.noise_logits_ref[0]
-        a_out = self.lora_A(x)
-        expert_outs = torch.stack([b(a_out) for b in self.lora_B], dim=-1)  # [T, B, out_dim, num_experts]
-        if noise_logits is not None:
-            weights = noise_logits.unsqueeze(2)                              # [T, B, 1, num_experts]
-        else:
-            T, B = x.size(0), x.size(1)
-            weights = x.new_ones(T, B, 1, len(self.lora_B)) / len(self.lora_B)
-        return self.base(x) + (expert_outs * weights).sum(dim=-1)
-
 
 class LoRAMoETransformerLayer(nn.Module):
     """
@@ -396,13 +370,16 @@ class LoRAMoETransformerLayer(nn.Module):
         for b in self.lora_B_fc2:
             nn.init.zeros_(b.weight)
 
-        # full 모드: attention projection도 LoRALinear로 교체
+        # full 모드: attention용 LoRA (embed_dim → rank → embed_dim), additive 방식
         if moe_mode == 'full':
-            sa = self.self_attn
-            sa.q_proj = LoRALinear(sa.q_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)
-            sa.k_proj = LoRALinear(sa.k_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)
-            sa.v_proj = LoRALinear(sa.v_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)
-            sa.out_proj = LoRALinear(sa.out_proj, embed_dim, embed_dim, noise_logits_ref, num_experts, rank)
+            self.lora_A_attn = nn.Linear(embed_dim, rank, bias=False)
+            self.lora_B_attn = nn.ModuleList([
+                nn.Linear(rank, embed_dim, bias=False) for _ in range(num_experts)
+            ])
+            nn.init.kaiming_uniform_(self.lora_A_attn.weight, a=math.sqrt(5))
+            self.lora_A_attn.weight.data *= 0.01
+            for b in self.lora_B_attn:
+                nn.init.zeros_(b.weight)
 
     def _apply_lora_moe(self, x, lora_A, lora_B):
         # x: [T, B, in_dim]
@@ -422,9 +399,12 @@ class LoRAMoETransformerLayer(nn.Module):
 
         if self.layer_norm_first:
             x = self.self_attn_layer_norm(x)
+            attn_in = x
             x, attn = self.self_attn(query=x, key=x, value=x,
                                      key_padding_mask=self_attn_padding_mask,
                                      attn_mask=self_attn_mask)
+            if self.moe_mode == 'full':
+                x = x + self._apply_lora_moe(attn_in, self.lora_A_attn, self.lora_B_attn)
             x = self.dropout1(x)
             x = residual + x
 
@@ -438,8 +418,11 @@ class LoRAMoETransformerLayer(nn.Module):
             x = self.dropout3(x)
             x = residual + x
         else:
+            attn_in = x
             x, attn = self.self_attn(query=x, key=x, value=x,
                                      key_padding_mask=self_attn_padding_mask)
+            if self.moe_mode == 'full':
+                x = x + self._apply_lora_moe(attn_in, self.lora_A_attn, self.lora_B_attn)
             x = self.dropout1(x)
             x = residual + x
             x = self.self_attn_layer_norm(x)
@@ -539,6 +522,10 @@ class AVHubertModel(BaseFairseqModel):
             torch.FloatTensor(cfg.audio_feat_dim).uniform_() if self.masking_type == 'input' else torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
 
+        if cfg.moe_mode not in ('none', 'None', None):
+            from omegaconf import open_dict
+            with open_dict(cfg):
+                cfg.encoder_layerdrop = 0.0
         self.encoder = TransformerEncoder(cfg)
         self.layer_norm = LayerNorm(self.embed)
 
