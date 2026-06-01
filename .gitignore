@@ -12,3 +12,7 @@ checkpoints/
 # dataset/cache
 data/
 datasets/
+avhubert/test/
+results/
+avhubert/test/
+results/

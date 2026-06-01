@@ -9,6 +9,12 @@
 conf_name=s2s_decode
 result=${1:?"Usage: $0 <result_path> <noise_mode>"}
 noise_mode=${2:?"Usage: $0 <result_path> <noise_mode>"}
+cl_threshold=$(python3 -c "
+import yaml
+with open('${result}/.hydra/config.yaml') as f:
+    cfg = yaml.safe_load(f)
+print(int(cfg['optimization']['max_update'] * 5 / 6))
+")
 
 # 터미널 출력과 동시에 로그 파일 저장
 mkdir -p "${result}/s2s"
@@ -79,10 +85,11 @@ elif [ "${noise_mode}" == "last" ]; then
         echo "=== [last] Using checkpoint_last.pt ==="
     fi
 elif [ "${noise_mode}" == "cl_loss" ]; then
-    # 150k 이후 valid_loss 최저 checkpoint 선택
-    ckpt=$(python3 - "${result}" <<'EOF'
+    # cl_threshold 이후 valid_loss 최저 checkpoint 선택
+    ckpt=$(python3 - "${result}" "${cl_threshold}" <<'EOF'
 import json, sys, os, glob
 result = sys.argv[1]
+cl_threshold = int(sys.argv[2])
 log_path = os.path.join(result, "hydra_train.log")
 ckpt_dir = os.path.join(result, "checkpoints")
 
@@ -101,7 +108,7 @@ with open(log_path) as f:
         except json.JSONDecodeError:
             continue
         num_updates = int(d.get("valid_num_updates", 0))
-        if num_updates <= 150000:
+        if num_updates <= cl_threshold:
             continue
         loss = d.get("valid_loss")
         if loss is None:
@@ -111,7 +118,7 @@ with open(log_path) as f:
             best_update = num_updates
 
 if best_update < 0:
-    print("ERROR: no valid_loss found after 150k updates in hydra_train.log", file=sys.stderr)
+    print(f"ERROR: no valid_loss found after {cl_threshold} updates in hydra_train.log", file=sys.stderr)
     sys.exit(1)
 
 matches = glob.glob(os.path.join(ckpt_dir, f"checkpoint_*_{best_update}.pt"))
@@ -127,11 +134,12 @@ EOF
     [ $? -ne 0 ] && exit 1
     echo "=== [${noise_mode}] Using checkpoint: ${ckpt} ==="
 else
-    # CL / CBCL: 150k 이후 valid_accuracy 최고 checkpoint 선택
-    ckpt=$(python3 - "${result}" <<'EOF'
+    # CL / CBCL: cl_threshold 이후 valid_accuracy 최고 checkpoint 선택
+    ckpt=$(python3 - "${result}" "${cl_threshold}" <<'EOF'
 import json, sys, os, glob
 
 result = sys.argv[1]
+cl_threshold = int(sys.argv[2])
 log_path = os.path.join(result, "hydra_train.log")
 ckpt_dir = os.path.join(result, "checkpoints")
 
@@ -150,7 +158,7 @@ with open(log_path) as f:
         except json.JSONDecodeError:
             continue
         num_updates = int(d.get("valid_num_updates", 0))
-        if num_updates <= 150000:
+        if num_updates <= cl_threshold:
             continue
         acc = d.get("valid_accuracy")
         if acc is None:
@@ -160,7 +168,7 @@ with open(log_path) as f:
             best_update = num_updates
 
 if best_update < 0:
-    print("ERROR: no valid_accuracy found after 150k updates in hydra_train.log", file=sys.stderr)
+    print(f"ERROR: no valid_accuracy found after {cl_threshold} updates in hydra_train.log", file=sys.stderr)
     sys.exit(1)
 
 matches = glob.glob(os.path.join(ckpt_dir, f"checkpoint_*_{best_update}.pt"))
@@ -242,4 +250,3 @@ summary_file="${result}/s2s/${noise_mode}_${ckpt_tag}.txt"
 
 echo ""
 echo "=== Summary saved: ${summary_file} ==="
-ㅁ
