@@ -65,7 +65,6 @@ optimization:
   lr: [0.001]
   sentence_avg: true
   update_freq: [1]
-  clip_norm: 50.0
 
 optimizer:
   _name: adam

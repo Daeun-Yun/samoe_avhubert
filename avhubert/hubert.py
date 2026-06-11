@@ -323,7 +323,6 @@ class AVHubertConfig(FairseqDataclass):
     )
     no_scale_embedding: bool = field(default=True, metadata={'help': 'scale embedding'})
 
-
 class LoRAMoETransformerLayer(nn.Module):
     """
     TransformerSentenceEncoderLayer 래퍼.
@@ -370,7 +369,7 @@ class LoRAMoETransformerLayer(nn.Module):
         for b in self.lora_B_fc2:
             nn.init.zeros_(b.weight)
 
-        # full 모드: attention용 LoRA (embed_dim → rank → embed_dim), additive 방식
+        # full 모드: attention 출력에도 FFN과 동일한 additive LoRA 적용 (embed_dim → rank → embed_dim)
         if moe_mode == 'full':
             self.lora_A_attn = nn.Linear(embed_dim, rank, bias=False)
             self.lora_B_attn = nn.ModuleList([
@@ -523,9 +522,7 @@ class AVHubertModel(BaseFairseqModel):
         )
 
         if cfg.moe_mode not in ('none', 'None', None):
-            from omegaconf import open_dict
-            with open_dict(cfg):
-                cfg.encoder_layerdrop = 0.0
+            cfg.encoder_layerdrop = 0.0
         self.encoder = TransformerEncoder(cfg)
         self.layer_norm = LayerNorm(self.embed)
 

@@ -253,20 +253,20 @@ class AVHubertDataset(FairseqDataset):
         [0.125, 0.125, 0.25, 0.5],               # Stage 4: 3명=50%, 이전({0,1,2}=50%)
     ]
     # CBCL stage 전환 비율: [0.5, 4/6, 5/6] * max_update
-    _CBCL_STAGE_RATIOS = (0.5, 4/6, 5/6)
+    _STAGE_RATIOS = (0.5, 4/6, 5/6)
 
     @property
     def current_update(self):
         return self._current_update.value
 
-    def _cbcl_stage(self, update):
-        return sum(update >= r * self.max_update for r in self._CBCL_STAGE_RATIOS)
+    def _stage(self, update):
+        return sum(update >= r * self.max_update for r in self._STAGE_RATIOS)
 
     @current_update.setter
     def current_update(self, value):
         if self.noise_mode == 'CL' or self.noise_mode == 'cl':
-            old_stage = self._cbcl_stage(self._current_update.value)
-            new_stage = self._cbcl_stage(value)
+            old_stage = self._stage(self._current_update.value)
+            new_stage = self._stage(value)
             self._current_update.value = value
             if new_stage != old_stage:
                 p = self._CL_STAGE_PROBS[new_stage]
@@ -276,8 +276,8 @@ class AVHubertDataset(FairseqDataset):
                     f"  (update={value})"
                 )
         elif self.noise_mode == 'CBCL' or self.noise_mode == 'cbcl':
-            old_stage = self._cbcl_stage(self._current_update.value)
-            new_stage = self._cbcl_stage(value)
+            old_stage = self._stage(self._current_update.value)
+            new_stage = self._stage(value)
             self._current_update.value = value
             if new_stage != old_stage:
                 p = self._CBCL_STAGE_PROBS[new_stage]
@@ -366,29 +366,28 @@ class AVHubertDataset(FairseqDataset):
 
         #noise_mode별 num_speakers 결정
         if self.noise_mode == 'CL' or self.noise_mode == 'cl':
-            # Curriculum Learning: CBCL과 동일한 비율로 stage 전환 (0.5, 4/6, 5/6) * max_update
+            # Curriculum Learning: 4 stage (_STAGE_RATIOS 기준)
             # 난이도: {1} → {0,1} → {0,1,2} → {0,1,2,3}
-            stage = self._cbcl_stage(self.current_update)
-            if stage == 0:
-                num_speakers = 1                         # Stage1: 항상 1명
-            elif stage == 1:
-                num_speakers = np.random.randint(0, 2)  # Stage2: {0,1}
-            elif stage == 2:
-                num_speakers = np.random.randint(0, 3)  # Stage3: {0,1,2}
-            else:
-                num_speakers = np.random.randint(0, 4)  # Stage4: {0,1,2,3}
+            stage = self._stage(self.current_update)
+            p = self._CL_STAGE_PROBS[stage]
+            num_speakers = np.random.choice([0, 1, 2, 3], p=p)
+
+            # if stage == 0:
+            #     num_speakers = 1                         # Stage1: 항상 1명
+            # elif stage == 1:
+            #     num_speakers = np.random.randint(0, 2)  # Stage2: {0,1}
+            # elif stage == 2:
+            #     num_speakers = np.random.randint(0, 3)  # Stage3: {0,1,2}
+            # else:
+            #     num_speakers = np.random.randint(0, 4)  # Stage4: {0,1,2,3}
         elif self.noise_mode == 'CBCL' or self.noise_mode == 'cbcl':
             # Class-Balanced CL: Stage1=50%(간섭1명), 이후 각 1/6씩 단계 추가
             # 새 단계=50%, 이전 구성=50% 누적
-            stage = self._cbcl_stage(self.current_update)
+            stage = self._stage(self.current_update)
             p = self._CBCL_STAGE_PROBS[stage]
             num_speakers = np.random.choice([0, 1, 2, 3], p=p)
         elif self.noise_mode == 'mix':
             num_speakers = np.random.randint(0, self.noise_num + 1)  # 0~noise_num random intervention
-            # num_speakers = 1
-            # num_speakers = np.random.choice([0, 1], p=[0.5,0.5])
-            # num_speakers = np.random.choice([0, 1, 2], p=[0.25, 0.25, 0.50])
-            # num_speakers = np.random.choice([0, 1, 2, 3], p=[0.125,0.125,0.25,0.50])
         else:
             num_speakers = self.noise_num
 

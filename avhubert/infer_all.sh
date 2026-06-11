@@ -9,6 +9,7 @@
 conf_name=s2s_decode
 result=${1:?"Usage: $0 <result_path> <noise_mode>"}
 noise_mode=${2:?"Usage: $0 <result_path> <noise_mode>"}
+data_433h=/home/dan/DB/lrs3/433h_data
 cl_threshold=$(python3 -c "
 import yaml
 with open('${result}/.hydra/config.yaml') as f:
@@ -186,9 +187,21 @@ EOF
 fi
 
 subsets=("test" "test1" "test2" "test3" "test4")
+# subset → correct router class (test=0, test1=1, test2=2, test3=3, test4=-1 skip)
+declare -A subset_router_class
+subset_router_class["test"]=0
+subset_router_class["test1"]=1
+subset_router_class["test2"]=2
+subset_router_class["test3"]=3
+subset_router_class["test4"]=-1
 
 for subset in "${subsets[@]}"; do
     echo "=== Inferring: ${subset} ==="
+    if [ "${subset}" == "test" ]; then
+        data_override=""
+    else
+        data_override="override.data=${data_433h} override.label_dir=${data_433h}"
+    fi
     python -B infer_s2s.py \
         --config-dir ./conf/ \
         --config-name ${conf_name} \
@@ -198,8 +211,9 @@ for subset in "${subsets[@]}"; do
         override.modalities=['audio','video'] \
         common.user_dir=`pwd` \
         override.noise_prob=0.0 \
+        override.router_correct_class=${subset_router_class[${subset}]} \
         distributed_training.distributed_world_size=1 \
-
+        ${data_override}
 done
 
 # 각 subset의 WER / Accuracy / MoE E[X] 수집 → total_wer.txt
@@ -208,6 +222,9 @@ total_wer_file="${result}/s2s/total_wer.txt"
 
 sum=0
 count=0
+router_acc_sum=0
+router_acc_count=0
+declare -a moe_ex_list
 
 for subset in "${subsets[@]}"; do
     wer_file=$(ls "${result}/s2s/${subset}/wer."* 2>/dev/null | head -1)
@@ -215,13 +232,23 @@ for subset in "${subsets[@]}"; do
         wer_value=$(grep "^WER:" "${wer_file}" | awk '{print $2}')
         acc=$(echo "scale=2; 100 - ${wer_value}" | bc)
         moe_ex=$(grep "MoE E\[X\]" "${wer_file}" | awk '{print $NF}')
+        router_acc=$(grep "^Router Acc" "${wer_file}" | awk '{print $NF}')
+        router_probs=$(grep "^Router_Probs:" "${wer_file}" | sed 's/Router_Probs: //')
         line="${subset}: WER: ${wer_value}  Acc: ${acc}%"
         [ -n "${moe_ex}" ] && line="${line}  MoE_EX: ${moe_ex}"
+        [ -n "${router_acc}" ] && line="${line}  Router_Acc: ${router_acc}"
+        [ -n "${router_probs}" ] && line="${line}  Router: ${router_probs}"
         echo "${line}" >> "${total_wer_file}"
+        moe_ex_list+=("${moe_ex:-N/A}")
         sum=$(echo "${sum} + ${wer_value}" | bc)
         count=$((count + 1))
+        if [ -n "${router_acc}" ]; then
+            router_acc_sum=$(echo "${router_acc_sum} + ${router_acc}" | bc)
+            router_acc_count=$((router_acc_count + 1))
+        fi
     else
         echo "${subset}: WER file not found" >> "${total_wer_file}"
+        moe_ex_list+=("N/A")
     fi
 done
 
@@ -230,6 +257,13 @@ if [ ${count} -gt 0 ]; then
     avg_acc=$(echo "scale=2; 100 - ${avg_wer}" | bc)
     echo "------------------------" >> "${total_wer_file}"
     echo "Average WER: ${avg_wer}  Average Acc: ${avg_acc}%" >> "${total_wer_file}"
+    if [ ${router_acc_count} -gt 0 ]; then
+        avg_router_acc=$(echo "scale=4; ${router_acc_sum} / ${router_acc_count}" | bc)
+        echo "Average Router Acc: ${avg_router_acc}  (over ${router_acc_count} subsets)" >> "${total_wer_file}"
+    fi
+    moe_ex_tuple=$(IFS=', '; echo "${moe_ex_list[*]}")
+    ex_label=$(IFS='/'; echo "${subsets[*]}")
+    echo "MoE_EX (${ex_label}): (${moe_ex_tuple})" >> "${total_wer_file}"
 fi
 
 echo ""

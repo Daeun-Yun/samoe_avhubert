@@ -56,6 +56,7 @@ class OverrideConfig(FairseqDataclass):
     modalities: List[str] = field(default_factory=lambda: [""], metadata={'help': 'which modality to use'})
     data: Optional[str] = field(default=None, metadata={'help': 'path to test data directory'})
     label_dir: Optional[str] = field(default=None, metadata={'help': 'path to test label directory'})
+    router_correct_class: int = field(default=-1, metadata={'help': 'correct router class index (0~3) for this subset; -1 = skip router acc'})
 
 @dataclass
 class InferConfig(FairseqDataclass):
@@ -207,7 +208,8 @@ def _main(cfg, output_file):
     num_sentences = 0
     has_target = True
     wps_meter = TimeMeter()
-    result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'moe_ex': []}
+    result_dict = {'utt_id': [], 'ref': [], 'hypo': [], 'moe_ex': [], 'router_acc': [], 'router_probs': []}
+    router_correct_class = cfg.override.router_correct_class  # -1 means skip
     for sample in progress:
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
@@ -240,15 +242,29 @@ def _main(cfg, output_file):
         except AttributeError:
             noise_logits = None
 
+        router_acc_per_sample = []
+        router_probs_per_sample = []
         if noise_logits is not None:
             with torch.no_grad():
                 K = noise_logits.shape[-1]
-                speaker_indices = torch.arange(1, K + 1, dtype=noise_logits.dtype, device=noise_logits.device)
+                # 0-indexed: class i = i interference speakers
+                speaker_indices = torch.arange(0, K, dtype=noise_logits.dtype, device=noise_logits.device)
                 ex_per_frame = (noise_logits * speaker_indices).sum(dim=-1)  # [T, B]
+                per_utt_probs = noise_logits.mean(dim=0)  # [B, K]
                 for bi in range(ex_per_frame.shape[1]):
                     moe_ex_per_sample.append(ex_per_frame[:, bi].mean().item())
+                    router_probs_per_sample.append(per_utt_probs[bi].cpu().tolist())
+                if router_correct_class >= 0:
+                    pred = noise_logits.argmax(dim=-1)  # [T, B]
+                    for bi in range(pred.shape[1]):
+                        acc = (pred[:, bi] == router_correct_class).float().mean().item()
+                        router_acc_per_sample.append(acc)
+                else:
+                    router_acc_per_sample = [None] * noise_logits.shape[1]
         else:
             moe_ex_per_sample = [None] * len(sample["id"])
+            router_acc_per_sample = [None] * len(sample["id"])
+            router_probs_per_sample = [None] * len(sample["id"])
 
         for i in range(len(sample["id"])):
             result_dict['utt_id'].append(sample['utt_id'][i])
@@ -259,6 +275,10 @@ def _main(cfg, output_file):
             result_dict['hypo'].append(hypo_str)
             ex_val = moe_ex_per_sample[i] if i < len(moe_ex_per_sample) else None
             result_dict['moe_ex'].append(ex_val)
+            acc_val = router_acc_per_sample[i] if i < len(router_acc_per_sample) else None
+            result_dict['router_acc'].append(acc_val)
+            probs_val = router_probs_per_sample[i] if i < len(router_probs_per_sample) else None
+            result_dict['router_probs'].append(probs_val)
             logger.info(f"\nREF:{ref_sent}\nHYP:{hypo_str}\n")
         wps_meter.update(num_generated_tokens)
         progress.log({"wps": round(wps_meter.avg)})
@@ -282,16 +302,31 @@ def _main(cfg, output_file):
     wer = 100 * n_err / n_total
     valid_ex = [v for v in result_dict['moe_ex'] if v is not None]
     mean_ex = sum(valid_ex) / len(valid_ex) if valid_ex else None
+    valid_acc = [v for v in result_dict['router_acc'] if v is not None]
+    mean_router_acc = sum(valid_acc) / len(valid_acc) if valid_acc else None
+    valid_probs = [v for v in result_dict['router_probs'] if v is not None]
+    if valid_probs:
+        K = len(valid_probs[0])
+        mean_probs = [sum(v[k] for v in valid_probs) / len(valid_probs) for k in range(K)]
+    else:
+        mean_probs = None
     wer_fn = f"{cfg.common_eval.results_path}/wer.{fid}"
     with open(wer_fn, "w") as fo:
         fo.write(f"WER: {wer}\n")
         fo.write(f"err / num_ref_words = {n_err} / {n_total}\n")
         if mean_ex is not None:
             fo.write(f"MoE E[X] (mean over {len(valid_ex)} utterances): {mean_ex:.4f}\n")
+        if mean_router_acc is not None:
+            fo.write(f"Router Acc argmax (class={router_correct_class}, mean over {len(valid_acc)} utterances): {mean_router_acc:.4f}\n")
+        if mean_probs is not None:
+            probs_str = "({})".format(", ".join(f"{p:.4f}" for p in mean_probs))
+            fo.write(f"Router_Probs: {probs_str}\n")
         fo.write(f"\n{yaml_str}")
     logger.info(f"WER: {wer}%")
     if mean_ex is not None:
         logger.info(f"MoE E[X] (avg): {mean_ex:.4f}  (computed over {len(valid_ex)} utterances)")
+    if mean_router_acc is not None:
+        logger.info(f"Router Acc argmax (class={router_correct_class}): {mean_router_acc:.4f}  (computed over {len(valid_acc)} utterances)")
     return
 
 

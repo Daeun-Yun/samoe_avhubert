@@ -28,6 +28,10 @@ class LabelSmoothedCrossEntropyCriterionConfig(FairseqDataclass):
         metadata={"help": "Ignore first N tokens"},
     )
     sentence_avg: bool = II("optimization.sentence_avg")
+    noise_lam: float = field(
+        default=1.0,
+        metadata={"help": "weight for router (noise classifier) loss: total_loss = asr_loss + noise_lam * noise_loss"},
+    )
 
 
 def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
@@ -83,9 +87,20 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         )
 
         asr_loss = loss  # noise_loss 더하기 전 ASR loss
-        noise_label = sample.get("noise_label", None)  # [B] or None
 
-        if noise_label is not None and "noise_logits" in net_output[1]:
+        # speaker_load / spk_label_cnt: noise_label만 있으면 moe_mode=none에서도 집계
+        if "noise_label" in sample:
+            noise_label = sample["noise_label"]
+            spk_cnts = {}
+            for n in range(4):
+                mask_n = noise_label == n
+                if mask_n.any():
+                    spk_cnts[n] = mask_n.sum().item()
+        else:
+            noise_label = None
+            spk_cnts = {}
+
+        if "noise_label" in sample and "noise_logits" in net_output[1]:
             noise_logits = net_output[1]["noise_logits"]                   # [T, B, 4]
             noise_label = noise_label.to(noise_logits.device)              # [B]
             T, B, E = noise_logits.shape
@@ -114,7 +129,7 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
                 # 2. Expert load (전체 토큰 합산)
                 expert_sums = noise_logits.sum(0).sum(0)  # [E]
 
-                # 3. 라우터 예측 화자 수 기댓값 (발화 단위)
+                # 3. 라우터 예측 화자 수 기댓값 (발화 단위, num_speaker_avg와 동일 단위)
                 per_utt = noise_logits.mean(0)  # [B, E]
                 spk_values = torch.arange(E, device=noise_logits.device, dtype=noise_logits.dtype)
                 router_pred_spk_sum = (per_utt * spk_values).sum(-1).sum().item()  # [B] → scalar
@@ -246,18 +261,16 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
                 "moe_routing_entropy", _sum("moe_entropy_sum") / token_count, round=4
             )
 
-        # 2. moe_expert_load=[e0,e1,e2,e3]
-        # _로 시작하는 hidden scalar에 매 interval마다 최신값 기록 →
-        # log_derived 람다가 해당 meter를 읽어서 항상 최신값 반영
-        for k in range(4):
-            val = _sum(f"moe_e{k}_sum") / token_count if token_count > 0 else 0.0
-            metrics.log_scalar(f"_moe_e{k}", val, round=4)
-        metrics.log_derived(
-            "moe_expert_load",
-            lambda m: "[{:.4f},{:.4f},{:.4f},{:.4f}]".format(
-                *[m[f"_moe_e{k}"].smoothed_value if f"_moe_e{k}" in m else 0.0 for k in range(4)]
+        # 2. moe_expert_load=[e0,e1,e2,e3] — moe_mode != none일 때만 출력
+        if token_count > 0:
+            for k in range(4):
+                metrics.log_scalar(f"_moe_e{k}", _sum(f"moe_e{k}_sum") / token_count, round=4)
+            metrics.log_derived(
+                "moe_expert_load",
+                lambda m: "[{:.4f},{:.4f},{:.4f},{:.4f}]".format(
+                    *[m[f"_moe_e{k}"].smoothed_value if f"_moe_e{k}" in m else 0.0 for k in range(4)]
+                )
             )
-        )
 
         # 3. speaker_load=[s0,s1,s2,s3]
         for n in range(4):
